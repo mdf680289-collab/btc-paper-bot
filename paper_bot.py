@@ -1,7 +1,7 @@
 import asyncio
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 import aiohttp
 from aiohttp import web
 import ccxt.async_support as ccxt
@@ -10,7 +10,7 @@ import ccxt.async_support as ccxt
 # 1. CONFIGURATION & STRICT RISK RULES
 # ==========================================
 CONFIG = {
-    "SYMBOL": "BTC/USDT:USDT",  # Fixed: CCXT format for Bybit USDT Perpetual Futures
+    "SYMBOL": "BTC/USDT",
     "TIMEFRAME": "1m",
     "WALLET_BALANCE": 20.00,
     "MARGIN_PER_TRADE": 4.00,
@@ -32,6 +32,7 @@ state = {
     "last_btc_price": 0.0,
     "range_low": 0.0,
     "range_high": 0.0,
+    "last_error": "None",
     "trade_history": []
 }
 
@@ -39,13 +40,14 @@ state = {
 # 2. EXACT $0.50 SL & DYNAMIC LEVERAGE ENGINE
 # ==========================================
 def calculate_trade_metrics(side: str, entry: float, raw_sl: float, raw_tp: float):
-    min_sl_dist = entry * 0.0020
+    # Minimum 0.15% SL (~$120 move) taaki exact $0.50 loss aaye
+    min_sl_dist = entry * 0.0015
     actual_sl_dist = max(abs(entry - raw_sl), min_sl_dist)
 
     sl_price = entry - actual_sl_dist if side == "LONG" else entry + actual_sl_dist
     sl_pct = actual_sl_dist / entry
 
-    min_tp_dist = actual_sl_dist * 2.2
+    min_tp_dist = actual_sl_dist * 2.2  # Minimum 1:2.2 R:R (+$1.10 USDT Profit)
     actual_tp_dist = max(abs(raw_tp - entry), min_tp_dist)
     tp_price = entry + actual_tp_dist if side == "LONG" else entry - actual_tp_dist
     tp_pct = actual_tp_dist / entry
@@ -100,8 +102,8 @@ async def manage_trade(exchange, side, entry, raw_sl, raw_tp, mode):
         state["active_trade"]["live_pnl"] = live_pnl
         state["active_trade"]["sl"] = current_sl
 
-        # +$0.60 par Breakeven Lock
-        if live_pnl >= 0.60 and not breakeven_activated:
+        # +$0.55 par Breakeven Lock
+        if live_pnl >= 0.55 and not breakeven_activated:
             current_sl = entry
             breakeven_activated = True
 
@@ -140,7 +142,6 @@ async def manage_trade(exchange, side, entry, raw_sl, raw_tp, mode):
 
     if state["daily_pnl"] <= -CONFIG["DAILY_LOSS_LIMIT"]:
         state["frozen"] = True
-        print("❄️ [FROZEN] Daily loss limit reached. Trading stopped until midnight.")
 
 # ==========================================
 # 4. 1-MINUTE SMC SCANNER & NEWS LISTENER
@@ -163,12 +164,17 @@ async def scan_1m_smc(exchange):
         state["last_btc_price"] = curr_close
         state["range_low"] = range_low
         state["range_high"] = range_high
+        state["last_error"] = "Connected & Scanning OK"
 
+        # Bearish Sweep -> SHORT
         if recent_high > range_high and curr_close < range_high:
-            return "SHORT", curr_close, recent_high + 25.0, range_low
+            return "SHORT", curr_close, recent_high + 15.0, range_low
+        # Bullish Sweep -> LONG
         elif recent_low < range_low and curr_close > range_low:
-            return "LONG", curr_close, recent_low - 25.0, range_high
+            return "LONG", curr_close, recent_low - 15.0, range_high
+
     except Exception as err:
+        state["last_error"] = str(err)[:60]
         print(f"[Scan Error] {err}")
     return None, None, None, None
 
@@ -181,34 +187,20 @@ async def tree_news_listener(exchange):
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             data = json.loads(msg.data)
                             title = data.get("title", "").upper()
-                            
                             if any(k in title for k in CONFIG["NEWS_KEYWORDS"]):
                                 if state["frozen"] or state["active_trade"]:
                                     continue
-                                
                                 state["is_news_event_active"] = True
-                                try:
-                                    # Safe execution block to prevent bot from getting stuck
-                                    ticker_0 = await exchange.fetch_ticker(CONFIG["SYMBOL"])
-                                    p0 = float(ticker_0["last"])
-                                    
-                                    await asyncio.sleep(2)
-                                    
-                                    ticker_1 = await exchange.fetch_ticker(CONFIG["SYMBOL"])
-                                    p1 = float(ticker_1["last"])
-                                    
-                                    move_pct = (p1 - p0) / p0
-                                    
-                                    if move_pct >= 0.0020:
-                                        await manage_trade(exchange, "LONG", p1, p1 * 0.9975, p1 * 1.0060, "NEWS SNIPER")
-                                    elif move_pct <= -0.0020:
-                                        await manage_trade(exchange, "SHORT", p1, p1 * 1.0025, p1 * 0.9940, "NEWS SNIPER")
-                                except Exception as err:
-                                    print(f"⚠️ [News API Error] {err}")
-                                finally:
-                                    state["is_news_event_active"] = False # Guaranteed unblock
-            except Exception as e:
-                print(f"⚠️ [Websocket Error] {e}")
+                                p0 = float((await exchange.fetch_ticker(CONFIG["SYMBOL"]))["last"])
+                                await asyncio.sleep(2)
+                                p1 = float((await exchange.fetch_ticker(CONFIG["SYMBOL"]))["last"])
+                                move_pct = (p1 - p0) / p0
+                                if move_pct >= 0.0020:
+                                    await manage_trade(exchange, "LONG", p1, p1 * 0.9975, p1 * 1.0060, "NEWS SNIPER")
+                                elif move_pct <= -0.0020:
+                                    await manage_trade(exchange, "SHORT", p1, p1 * 1.0025, p1 * 0.9940, "NEWS SNIPER")
+                                state["is_news_event_active"] = False
+            except Exception:
                 await asyncio.sleep(5)
 
 async def normal_day_scanner(exchange):
@@ -221,40 +213,17 @@ async def normal_day_scanner(exchange):
             await manage_trade(exchange, side, entry, raw_sl, raw_tp, "1M SMC SWEEP")
 
 # ==========================================
-# 5. DAILY RESET TASK (NEW)
-# ==========================================
-async def daily_reset_task():
-    """Resets daily PnL and Frozen state every day at Midnight (UTC)"""
-    while True:
-        now = datetime.utcnow()
-        # Calculate time until next midnight
-        next_midnight = datetime(now.year, now.month, now.day, 23, 59, 59)
-        sleep_seconds = (next_midnight - now).total_seconds() + 2
-        
-        if sleep_seconds > 0:
-            await asyncio.sleep(sleep_seconds)
-            
-        # Unfreeze and reset daily stats
-        state["daily_pnl"] = 0.0
-        state["frozen"] = False
-        state["trades_taken"] = 0
-        state["wins"] = 0
-        state["losses"] = 0
-        # trade_history is intentionally kept so you can see past trades on the dashboard
-        print("🔄 [MIDNIGHT RESET] Daily limits and Frozen state have been reset for the new day.")
-
-# ==========================================
-# 6. MOBILE LIVE WEB DASHBOARD (FOR RENDER)
+# 5. MOBILE LIVE WEB DASHBOARD (FOR RENDER)
 # ==========================================
 async def handle_dashboard(request):
-    active_html = "<p style='color:#9ca3af;'>No active trade right now. Scanning 1m candles...</p>"
+    active_html = f"<p style='color:#9ca3af;'>No active trade right now. Feed Status: <b>{state['last_error']}</b></p>"
     if state["active_trade"]:
         t = state["active_trade"]
         color = "#10b981" if t["live_pnl"] >= 0 else "#ef4444"
         active_html = f"""
-        <div style='background:#1f2937; padding:12px; border-radius:8px; border-left:4px solid {color};'>
+        <div style='background:#1f2937; padding:12px; border-radius:8px; border-left:4px solid {color}; margin-bottom:15px;'>
             <b>🔥 ACTIVE {t['side']} ({t['mode']})</b><br>
-            Entry: ${t['entry']:,.1f} | SL: ${t['sl']:,.1f} | TP: ${t['tp']:,.1f} | Lev: {t['leverage']}x<br>
+            Entry: ${t['entry']:,.1f} | SL: ${t['sl']:,.1f} (-$0.50) | TP: ${t['tp']:,.1f} | Lev: {t['leverage']}x<br>
             <b>Live PnL: <span style='color:{color};'>${t['live_pnl']:.2f} USDT</span></b>
         </div>
         """
@@ -282,8 +251,7 @@ async def handle_dashboard(request):
         <div class="card">
             <h3>💰 Wallet: ${state['balance']:.2f} USDT | Today PnL: <span style="color:{'#10b981' if state['daily_pnl']>=0 else '#ef4444'}">${state['daily_pnl']:.2f} USDT</span></h3>
             <p>📊 Live BTC: <b>${state['last_btc_price']:,.1f}</b> | Range L: ${state['range_low']:,.1f} | Range H: ${state['range_high']:,.1f}</p>
-            <p>🎯 Trades: {state['trades_taken']} (Wins: {state['wins']} | Losses: {state['losses']}) | Margin: $4.00</p>
-            <p style="color:#ef4444; font-weight:bold; display:{'block' if state['frozen'] else 'none'};">❄️ DAILY LOSS LIMIT HIT - BOT FROZEN UNTIL MIDNIGHT</p>
+            <p>🎯 Trades: {state['trades_taken']} (Wins: {state['wins']} | Losses: {state['losses']}) | Margin: $4.00 | Fixed SL: -$0.50</p>
         </div>
         {active_html}
         <h3>📜 Trade History</h3>
@@ -307,15 +275,15 @@ async def start_web_server():
     print(f"🌐 Live Dashboard started on port {port}")
 
 # ==========================================
-# 6. MAIN RUNNER (CLOUD READY)
+# 6. MAIN RUNNER (US-CLOUD COMPATIBLE)
 # ==========================================
 async def main():
-    exchange = ccxt.bybit({"enableRateLimit": True})
+    # Kraken works 100% on US Render servers without IP blocks!
+    exchange = ccxt.kraken({"enableRateLimit": True})
     await start_web_server()
     await asyncio.gather(
         tree_news_listener(exchange),
-        normal_day_scanner(exchange),
-        daily_reset_task()  # <--- Auto unfreeze task added here
+        normal_day_scanner(exchange)
     )
 
 if __name__ == "__main__":
